@@ -341,6 +341,9 @@ int main(void)
 	do {
 		GetKey(&key);
 	} while (key != KEY_CTRL_EXE);
+	/* a fresh screen: these two lines stay up while Linux decompresses */
+	Bdisp_AllClr_VRAM();
+	line = 1;
 	print("Booting Linux...", COLOR_BLUE);
 	print("(RESET to go back)", COLOR_BLACK);
 

@@ -1,27 +1,19 @@
 /*
  * fxcg-linux loader: boots a Linux zImage on the Casio fx-CG10/fx-CG20.
  *
- * The add-in reads \\fls0\linux.bin from the storage memory into the
- * 512 KiB add-in RAM (and, for big images, into the VRAM), records the
- * physical address of every page from the UTLB, writes the data back
- * from the cache and finally hands over to trampoline.S running from the
- * on-chip IL memory, which switches the MMU off, gathers the pages into
- * one block at 0x08040000 and jumps to it. The zImage then moves itself
- * to its link address and decompresses the kernel.
+ * The add-in reads the kernel file (\\fls0\linux.bin, or linuxf.bin)
+ * into the RAM the Casio OS leaves to an add-in (the free part of the
+ * add-in RAM, blocks of the OS heap, the VRAM), records the physical
+ * address of every page from the UTLB, writes the data back from the
+ * cache and hands over to trampoline.S, run from the on-chip IL memory,
+ * which switches the MMU off, gathers the pages at 0x08040000 and jumps
+ * to them.
  *
- * F2 boots \\fls0\linuxf.bin instead, a kernel with part of its code in
- * two flash areas the Casio OS leaves free (0xc00000-0xc7ffff and
- * 0xb20000-0xb3ffff): only when the flash holds exactly the part it was
- * built with (the trailer at the end of linuxf.bin against each area's
- * header, and the CRC of the contents). When it does not, and
- * \\fls0\flash.bin is there, F2 boots linux.bin to install flash.bin (the
- * loader never writes to the flash itself: its own code and the Casio OS
- * run from it), which then resets. F6 boots linux.bin to erase those
- * areas again. The word at the end of the IL memory tells the kernel
- * which.
- *
- * There is no way back except a reset: Linux owns all of the RAM, so the
- * Casio OS state is gone. The loader never writes to the flash.
+ * linuxf.bin has part of its code in the flash at 0xc00000 and 0xb20000.
+ * F2 boots it only when the trailer at its end matches each area's
+ * header and the CRC of its contents; otherwise, with \\fls0\flash.bin
+ * there, linux.bin is booted to install it. F6 boots linux.bin to remove
+ * it. The word at the end of the IL memory tells the kernel which.
  */
 typedef unsigned char u8;
 typedef unsigned short u16;

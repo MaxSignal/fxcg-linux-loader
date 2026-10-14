@@ -7,10 +7,10 @@ branch `fxcg20-7.2.y`) and the BusyBox system it starts.
 
 ## What it does
 
-Its menu: **F1** boots `linux.bin` in RAM (below), **F2** the kernel that
-runs in place from the flash (next section), **F6** removes that one;
-**EXE** is F2 when there is something to boot or install there, F1
-otherwise.
+Its menu: **F1** boots `linux.bin` in RAM (below), **F2** `linuxf.bin`,
+a kernel with part of its code in the flash (next section), **F6** erases
+that part; **EXE** is F2 when there is something to boot or install
+there, F1 otherwise.
 
 1. Opens `\\fls0\linux.bin` (a SuperH zImage) in the storage memory.
 2. Stages it in whatever RAM the Casio OS leaves to an add-in: the free part
@@ -35,21 +35,22 @@ of physical RAM (that is, on an fx-CG50).
 There is no way back to the Casio OS except a reset: the kernel owns all
 of the RAM. The loader never writes to the flash.
 
-### The kernel in the flash
+### Part of the kernel in the flash
 
-The bundle's `xip.bin` is a kernel and a romfs root file system that run
-in place from the free flash after the Casio OS image, packed below
-0xb40000 with a header in its last 256 bytes. F2 checks that header and
-the CRCs of the kernel and the romfs, and the trampoline jumps straight
-to the kernel (no pieces to gather).
+The bundle's `linuxf.bin` has part of its code linked at two flash areas
+the Casio OS leaves free (0xc00000–0xc7ffff and 0xb20000–0xb3ffff; it
+checks 0–0xb1ffff at boot and owns the storage memory from 0xc80000).
+`linuxf.bin` itself is loaded like `linux.bin`; F2 offers it only when
+the flash holds exactly its part: the 64-byte trailer at the end of
+`linuxf.bin` ("fxcgROMK", then address, length and CRC-32 of each area)
+must match each area's header ("fxcgROM1") and the CRC of its contents.
 
-When the flash does not hold it, or `\\fls0\xip.bin` is a different image
-(its header differs), F2 boots `linux.bin` to install it, and F6 boots
-`linux.bin` to remove it: the add-in cannot write the flash it and the
-Casio OS run from, Linux running from RAM can (`/dev/xipflash`). The
-loader tells the kernel which with a word at the end of the IL memory,
-0xE5200FF0: `"fxcgMODE"`, then 1 (install, and start it) or 2 (remove);
-0 for a plain boot.
+When it does not and `\\fls0\flash.bin` is there, F2 boots `linux.bin`
+to install it, and F6 boots `linux.bin` to erase the areas: the add-in
+cannot write the flash it and the Casio OS run from, Linux running from
+RAM can (`/dev/xipflash`). The loader tells the kernel which with a word
+at the end of the IL memory, 0xE5200FF0: `"fxcgMODE"`, then 1 (install)
+or 2 (remove); 0 for a plain boot.
 
 ### Hand-over state
 
@@ -59,7 +60,7 @@ loader tells the kernel which with a word at the end of the IL memory,
 | MMU | off, UTLB invalidated |
 | caches | enabled as the OS left them, contents invalidated |
 | INTC | all IPR fields 0, all IMR bits set |
-| PC | 0x08040000 (start of the zImage), or the kernel's entry in the flash |
+| PC | 0x08040000 (start of the zImage) |
 | boot parameters | none (the kernel uses its built-in command line) |
 
 ### Image size

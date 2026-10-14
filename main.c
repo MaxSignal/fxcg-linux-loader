@@ -9,14 +9,16 @@
  * one block at 0x08040000 and jumps to it. The zImage then moves itself
  * to its link address and decompresses the kernel.
  *
- * F2 boots instead the kernel that runs in place from the free flash
- * below 0xb40000, with its romfs root file system: its header and CRCs
- * are checked and the trampoline jumps straight to it, nothing to copy.
- * When it is not there yet, or \\fls0\xip.bin is a different one, linux.bin
- * is booted to install it (the loader never writes to the flash itself:
- * its own code and the Casio OS run from it); that kernel then starts the
- * new one. F6 boots linux.bin to remove it, which leaves the flash erased
- * as it was. The word at the end of the IL memory tells the kernel which.
+ * F2 boots \\fls0\linuxf.bin instead, a kernel with part of its code in
+ * two flash areas the Casio OS leaves free (0xc00000-0xc7ffff and
+ * 0xb20000-0xb3ffff): only when the flash holds exactly the part it was
+ * built with (the trailer at the end of linuxf.bin against each area's
+ * header, and the CRC of the contents). When it does not, and
+ * \\fls0\flash.bin is there, F2 boots linux.bin to install flash.bin (the
+ * loader never writes to the flash itself: its own code and the Casio OS
+ * run from it), which then resets. F6 boots linux.bin to erase those
+ * areas again. The word at the end of the IL memory tells the kernel
+ * which.
  *
  * There is no way back except a reset: Linux owns all of the RAM, so the
  * Casio OS state is gone. The loader never writes to the flash.
@@ -293,9 +295,14 @@ static u32 stage(int fd, u32 va, u32 len, u32 *done, u32 size)
 
 /* ------------------------------------------------- kernel in the flash */
 
-/* scripts/mkxip.py in fxcg20-Linux-bundle, arch/sh/boards/mach-fxcg/xip.c */
-#define XIP_HEADER	0xa0b3ff00u	/* P2: uncached */
-#define XIP_END		0x00b40000u
+/* fxcg20-Linux-bundle scripts/romkernel.py, arch/sh/boards/mach-fxcg/xipflash.c */
+#define NR_AREAS	2
+static const u32 area_start[NR_AREAS] = { 0x00c00000, 0x00b20000 };
+static const u32 area_size[NR_AREAS] = { 0x80000, 0x20000 };
+
+static const char kernel_path[] = "\\\\fls0\\linux.bin";
+static const char linuxf_path[] = "\\\\fls0\\linuxf.bin";
+static const char flash_path[] = "\\\\fls0\\flash.bin";
 
 static u32 be32(const u8 *p)
 {
@@ -321,58 +328,70 @@ static u32 crc32(const u8 *p, u32 n)
 	return ~c;
 }
 
-/* The entry point of the kernel in the flash, 0 if there is none. */
-static u32 xip_kernel(void)
+static int open_file(const char *path)
 {
-	const u8 *h = (const u8 *)XIP_HEADER;
-	u32 ks, kl, rs, rl, entry;
+	u16 name[32];
+	int i;
 
-	if (memcmp(h, "fxcgXIP1", 8) || be32(h + 8) != 64 ||
-	    crc32(h, 60) != be32(h + 60))
-		return 0;
-	ks = be32(h + 12);
-	kl = be32(h + 16);
-	rs = be32(h + 24);
-	rl = be32(h + 28);
-	entry = be32(h + 36);
-	if (rs < 0x20000 || rs + rl > ks || ks + kl > XIP_END - 0x100 ||
-	    entry < ks || entry >= ks + kl)
-		return 0;
-	if (crc32((const u8 *)P2(ks), kl) != be32(h + 20) ||
-	    crc32((const u8 *)P2(rs), rl) != be32(h + 32)) {
-		print("Linux in flash: bad CRC", COLOR_RED);
-		return 0;
-	}
-	print_kib("Linux in flash: ", kl + rl, COLOR_BLACK);
-	return entry;
+	for (i = 0; path[i] && i < 31; i++)
+		name[i] = (u8)path[i];
+	name[i] = 0;
+	return Bfile_OpenFile_OS(name, 0, 0);
 }
 
-enum { MODE_RUN, MODE_INSTALL, MODE_REMOVE };
-
-static const char xip_path[] = "\\\\fls0\\xip.bin";
-
-/* Is \\fls0\xip.bin there, and is it what the flash holds already? */
-static int xip_file(int *same)
+static int file_exists(const char *path)
 {
-	u16 name[sizeof(xip_path)];
-	u8 h[64];
-	int fd, size, i;
+	int fd = open_file(path);
 
-	for (i = 0; i < (int)sizeof(xip_path); i++)
-		name[i] = (u8)xip_path[i];
-	*same = 0;
-	fd = Bfile_OpenFile_OS(name, 0, 0);
 	if (fd < 0)
 		return 0;
-	size = Bfile_GetFileSize_OS(fd);
-	/* its header is in its last 256 bytes, as in the flash */
-	if (size >= 0x20000 && Bfile_ReadFile_OS(fd, h, 64, size - 0x100) == 64)
-		*same = !memcmp(h, (const u8 *)XIP_HEADER, 64);
 	Bfile_CloseFile_OS(fd);
 	return 1;
 }
 
-static void __attribute__((noreturn)) boot(u32 entry, int copy, u32 mode)
+/* Does area i start with a header written by the installer? */
+static int area_ours(int i)
+{
+	const u8 *h = (const u8 *)P2(area_start[i]);
+
+	return !memcmp(h, "fxcgROM1", 8) && crc32(h, 60) == be32(h + 60) &&
+	       be32(h + 8) == area_start[i];
+}
+
+/*
+ * 1 when the flash holds the part linuxf.bin was built with, 0 when it
+ * does not, -1 when there is no linuxf.bin.
+ */
+static int rom_matches(void)
+{
+	u8 t[64];
+	int fd = open_file(linuxf_path), size, ok, i;
+
+	if (fd < 0)
+		return -1;
+	size = Bfile_GetFileSize_OS(fd);
+	ok = size > 64 && Bfile_ReadFile_OS(fd, t, 64, size - 64) == 64;
+	Bfile_CloseFile_OS(fd);
+	if (!ok || memcmp(t, "fxcgROMK", 8) || crc32(t, 60) != be32(t + 60) ||
+	    be32(t + 8) != NR_AREAS)
+		return 0;
+	for (i = 0; i < NR_AREAS; i++) {
+		u32 addr = be32(t + 12 + 12 * i), len = be32(t + 16 + 12 * i);
+		u32 crc = be32(t + 20 + 12 * i);
+		const u8 *h = (const u8 *)P2(area_start[i]);
+
+		if (addr != area_start[i] || len < 64 || len > area_size[i] ||
+		    !area_ours(i) || be32(h + 12) != len || be32(h + 16) != crc ||
+		    crc32(h + 64, len - 64) != crc)
+			return 0;
+	}
+	return 1;
+}
+
+/* what the kernel is to do, in the word at the end of the IL memory */
+enum { MODE_RUN, MODE_INSTALL, MODE_REMOVE };
+
+static void __attribute__((noreturn)) boot(u32 entry, u32 mode)
 {
 	volatile u32 *m = (volatile u32 *)IL_MODE;
 	struct boot_table *t;
@@ -387,7 +406,7 @@ static void __attribute__((noreturn)) boot(u32 entry, int copy, u32 mode)
 	t = (struct boot_table *)IL_TABLE;
 	t->dest = P2(DEST);
 	t->entry = entry;
-	t->nchunks = copy ? nchunks : 0;
+	t->nchunks = nchunks;
 	for (i = 0; i < (int)t->nchunks; i++)
 		t->chunk[i] = chunks[i];
 
@@ -398,13 +417,11 @@ static void __attribute__((noreturn)) boot(u32 entry, int copy, u32 mode)
 
 /* ---------------------------------------------------------------- main */
 
-static const char kernel_path[] = "\\\\fls0\\linux.bin";
-
 int main(void)
 {
-	u16 name[sizeof(kernel_path)];
-	u32 size, done, va, sp, sp_pa, pa, n, end, heap, xip, mode = MODE_RUN;
-	int fd, key, i, have_file, same;
+	u32 size, done, va, sp, sp_pa, pa, n, end, heap, mode = MODE_RUN;
+	int fd, key, rom, have_flash, present, can_f2;
+	const char *path = kernel_path;
 
 	Bdisp_EnableColor(1);
 	EnableStatusArea(3);
@@ -416,37 +433,34 @@ int main(void)
 	if (pa < RAM_BASE || pa >= RAM_END)
 		fail("Not an fx-CG10/20");
 
-	xip = xip_kernel();
-	have_file = xip_file(&same);
-	if (have_file && !same)
-		print("xip.bin is new", COLOR_BLACK);
+	rom = rom_matches();
+	have_flash = file_exists(flash_path);
+	present = area_ours(0) || area_ours(1);
+	can_f2 = rom == 1 || (rom == 0 && have_flash);
 	print("F1: Linux in RAM", COLOR_BLUE);
-	if (xip && (same || !have_file))
-		print("F2: Linux in flash", COLOR_BLUE);
-	else if (have_file)
-		print("F2: install to flash", COLOR_BLUE);
-	if (xip)
+	if (rom == 1)
+		print("F2: Linux (flash)", COLOR_BLUE);
+	else if (can_f2)
+		print("F2: install flash.bin", COLOR_BLUE);
+	if (present)
 		print("F6: remove from flash", COLOR_BLACK);
 	print("Main Memory is lost.", COLOR_RED);
 	/* EXE: F2 when there is something to boot or install there */
 	for (;;) {
 		GetKey(&key);
 		if (key == KEY_CTRL_EXE)
-			key = xip || have_file ? KEY_CTRL_F2 : KEY_CTRL_F1;
+			key = can_f2 ? KEY_CTRL_F2 : KEY_CTRL_F1;
 		if (key == KEY_CTRL_F1)
 			break;
-		if (key == KEY_CTRL_F2 && xip && (same || !have_file)) {
-			Bdisp_AllClr_VRAM();
-			line = 1;
-			print("Booting Linux...", COLOR_BLUE);
-			print("(RESET to go back)", COLOR_BLACK);
-			boot(xip, 0, MODE_RUN);
+		if (key == KEY_CTRL_F2 && rom == 1) {
+			path = linuxf_path;
+			break;
 		}
-		if (key == KEY_CTRL_F2 && have_file) {
+		if (key == KEY_CTRL_F2 && can_f2) {
 			mode = MODE_INSTALL;
 			break;
 		}
-		if (key == KEY_CTRL_F6 && xip) {
+		if (key == KEY_CTRL_F6 && present) {
 			mode = MODE_REMOVE;
 			break;
 		}
@@ -458,14 +472,12 @@ int main(void)
 	if (mode == MODE_REMOVE)
 		print("Linux to remove it", COLOR_BLUE);
 
-	for (i = 0; i < (int)sizeof(kernel_path); i++)
-		name[i] = (u8)kernel_path[i];
-	fd = Bfile_OpenFile_OS(name, 0, 0);
+	fd = open_file(path);
 	if (fd < 0)
-		fail("linux.bin not found");
+		fail(path == kernel_path ? "linux.bin not found" : "linuxf.bin not found");
 	size = Bfile_GetFileSize_OS(fd);
 	if (size < 1024 || (size & 3))
-		fail("linux.bin is invalid");
+		fail("the kernel file is invalid");
 	print_kib("image: ", size, COLOR_BLACK);
 
 	__asm__("mov r15, %0" : "=r"(sp));
@@ -500,9 +512,9 @@ int main(void)
 
 	/* 3. the VRAM (start of the RAM), filled at the very end */
 	if (size - done > VRAM_SIZE)
-		fail("linux.bin is too large");
+		fail("the kernel is too large");
 	if (DEST + size > RAM_END)
-		fail("linux.bin is too large");
+		fail("the kernel is too large");
 
 	/* a fresh screen: these two lines stay up while Linux decompresses */
 	Bdisp_AllClr_VRAM();
@@ -522,5 +534,5 @@ int main(void)
 		stage(fd, P2(pa), n, &done, size);
 	}
 	Bfile_CloseFile_OS(fd);
-	boot(DEST, 1, mode);
+	boot(DEST, mode);
 }
